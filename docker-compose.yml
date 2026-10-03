@@ -1,0 +1,78 @@
+# Infra para desenvolvimento e testes:
+#   docker compose up -d --wait postgres localstack
+# Infra + 3 instâncias da aplicação (portas 3000, 3001 e 3002):
+#   docker compose --profile app up -d --build --wait
+name: wagering
+
+x-app-env: &app-env
+  DATABASE_URL: postgres://postgres:postgres@postgres:5432/wagering
+  DB_POOL_MAX: '20'
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL: http://localstack:4566
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  SQS_AUTO_CREATE: 'true'
+  LOG_LEVEL: info
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    command: ['postgres', '-c', 'max_connections=300']
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: wagering
+    ports:
+      - '5432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d wagering']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  localstack:
+    # Versão fixada da edição community (só SQS). MiniStack também serve: troque a imagem e
+    # mantenha a porta 4566.
+    image: localstack/localstack:3.8.1
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      EAGER_SERVICE_LOADING: '1'
+    ports:
+      - '4566:4566'
+    healthcheck:
+      test: ['CMD-SHELL', "curl -sf http://localhost:4566/_localstack/health | grep -Eq '\"sqs\": \"(available|running)\"'"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  migrate:
+    profiles: ['app']
+    build: .
+    command: ['bun', 'run', 'src/infrastructure/persistence/migrate.ts', 'up']
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    profiles: ['app']
+    build: .
+    environment:
+      <<: *app-env
+    deploy:
+      replicas: 3
+    ports:
+      - '3000-3002:3000'
+    stop_grace_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      localstack:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'bun', '-e', "fetch('http://localhost:3000/health/ready').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
